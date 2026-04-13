@@ -1,5 +1,5 @@
 flask
-alpaca-trade-api==3.3.2
+alpaca-trade-api==3.2.0
 yfinance==0.2.51
 pandas==2.2.2
 ta==0.11.0
