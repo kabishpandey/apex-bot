@@ -10,7 +10,7 @@ from datetime import datetime
 import pytz
 
 import pandas as pd
-import pandas_ta as ta
+import ta as talib
 import yfinance as yf
 import alpaca_trade_api as tradeapi
 from flask import Flask, jsonify
@@ -92,7 +92,7 @@ def get_daily_ema50(symbol=SYMBOL):
     if df.empty:
         return None
     df.columns = [c.lower() for c in df.columns]
-    ema = ta.ema(df["close"], length=50)
+    ema = talib.trend.ema_indicator(df["close"], window=50)
     return float(ema.iloc[-1])
 
 
@@ -101,15 +101,21 @@ def get_daily_ema50(symbol=SYMBOL):
 # ══════════════════════════════════════════════════════════════════════
 
 def calc_supertrend(df, length=ST_LEN, multiplier=ST_MULT):
-    """Calculate SuperTrend — same logic as Pine Script."""
-    hl2    = (df["high"] + df["low"]) / 2
-    atr_st = ta.atr(df["high"], df["low"], df["close"], length=length)
+    """Calculate SuperTrend — same logic as Pine Script, using pure pandas."""
+    hl2 = (df["high"] + df["low"]) / 2
+
+    # ATR manually (no pandas_ta)
+    high_low   = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close  = (df["low"]  - df["close"].shift()).abs()
+    tr         = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr_st     = tr.ewm(alpha=1/length, adjust=False).mean()
 
     upper = hl2 + multiplier * atr_st
     lower = hl2 - multiplier * atr_st
 
-    st_upper = [float("nan")] * len(df)
-    st_lower = [float("nan")] * len(df)
+    st_upper  = [float("nan")] * len(df)
+    st_lower  = [float("nan")] * len(df)
     direction = [1] * len(df)
 
     for i in range(1, len(df)):
@@ -124,41 +130,41 @@ def calc_supertrend(df, length=ST_LEN, multiplier=ST_MULT):
         else:
             direction[i] = -1 if df["close"].iloc[i] < pl else 1
 
-    df["st_dir"]   = direction
-    df["st_bull"]  = df["st_dir"] == 1
-    df["st_line"]  = [st_lower[i] if direction[i] == 1 else st_upper[i]
-                      for i in range(len(df))]
+    df["st_dir"]  = direction
+    df["st_bull"] = df["st_dir"] == 1
+    df["st_line"] = [st_lower[i] if direction[i] == 1 else st_upper[i]
+                     for i in range(len(df))]
     return df
 
 
 def add_indicators(df):
     """Add all indicators to the dataframe."""
     # MAs
-    df["ema21"]  = ta.ema(df["close"], length=EMA_FAST)
-    df["ema55"]  = ta.ema(df["close"], length=EMA_SLOW)
-    df["sma50"]  = ta.sma(df["close"], length=SMA_50)
-    df["sma200"] = ta.sma(df["close"], length=SMA_200)
+    df["ema21"]  = talib.trend.ema_indicator(df["close"], window=EMA_FAST)
+    df["ema55"]  = talib.trend.ema_indicator(df["close"], window=EMA_SLOW)
+    df["sma50"]  = talib.trend.sma_indicator(df["close"], window=SMA_50)
+    df["sma200"] = talib.trend.sma_indicator(df["close"], window=SMA_200)
 
     # ATR
-    df["atr"]        = ta.atr(df["high"], df["low"], df["close"], length=ATR_LEN)
-    df["atr_20avg"]  = df["atr"].rolling(20).mean()
+    df["atr"]       = talib.volatility.average_true_range(df["high"], df["low"], df["close"], window=ATR_LEN)
+    df["atr_20avg"] = df["atr"].rolling(20).mean()
 
     # RSI
-    df["rsi"] = ta.rsi(df["close"], length=RSI_LEN)
+    df["rsi"] = talib.momentum.rsi(df["close"], window=RSI_LEN)
 
-    # MACD
-    macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
-    df["macd_hist"] = macd["MACDh_12_26_9"]
+    # MACD histogram
+    macd_line   = talib.trend.macd(df["close"])
+    signal_line = talib.trend.macd_signal(df["close"])
+    df["macd_hist"] = macd_line - signal_line
 
     # Volume
     df["vol_avg"] = df["volume"].rolling(20).mean()
 
+    # ADX
+    df["adx"] = talib.trend.adx_neg(df["high"], df["low"], df["close"], window=14)
+
     # SuperTrend
     df = calc_supertrend(df)
-
-    # ADX
-    adx = ta.adx(df["high"], df["low"], df["close"], length=14)
-    df["adx"] = adx["ADX_14"]
 
     df.dropna(inplace=True)
     return df
