@@ -1,0 +1,7 @@
+flask
+alpaca-trade-api
+yfinance
+pandas
+pandas-ta
+pytz
+requests
