@@ -79,15 +79,35 @@ CB_LOSSES    = 3
 #  DATA
 # ══════════════════════════════════════════════════════════════════════
 
+def _download_with_timeout(symbol, period, interval, timeout=30):
+    """Run yf.download in a thread with a hard timeout."""
+    result = [None]
+    error  = [None]
+
+    def _dl():
+        try:
+            result[0] = yf.download(symbol, period=period, interval=interval,
+                                     auto_adjust=True, progress=False)
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=_dl, daemon=True)
+    t.start()
+    t.join(timeout)
+
+    if t.is_alive():
+        log.error(f"Yahoo Finance download timed out after {timeout}s — skipping")
+        return None
+    if error[0]:
+        log.error(f"Yahoo Finance download error: {error[0]}")
+        return None
+    return result[0]
+
+
 def get_data(symbol=SYMBOL, period="180d", interval="1h"):
     """Fetch OHLCV data from Yahoo Finance."""
     log.info(f"Fetching {symbol} data...")
-    try:
-        df = yf.download(symbol, period=period, interval=interval,
-                         auto_adjust=True, progress=False)
-    except Exception as e:
-        log.error(f"Yahoo Finance download error: {e}")
-        return None
+    df = _download_with_timeout(symbol, period, interval, timeout=30)
 
     if df is None or df.empty:
         log.error("No data returned from Yahoo Finance!")
@@ -112,8 +132,7 @@ def get_data(symbol=SYMBOL, period="180d", interval="1h"):
 def get_daily_ema50(symbol=SYMBOL):
     """Fetch daily EMA50 for HTF filter."""
     try:
-        df = yf.download(symbol, period="120d", interval="1d",
-                         auto_adjust=True, progress=False)
+        df = _download_with_timeout(symbol, period="120d", interval="1d", timeout=30)
         if df is None or df.empty:
             return None
         df.columns = [c.lower() if isinstance(c, str) else c[0].lower() for c in df.columns]
