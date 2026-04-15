@@ -6,14 +6,14 @@ Runs 24/7 on Render.com, pulls live data, trades on Alpaca paper account.
 import time
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import traceback
 
 import pandas as pd
 import ta as talib
-import yfinance as yf
 import alpaca_trade_api as tradeapi
+from alpaca_trade_api.rest import TimeFrame
 from flask import Flask, jsonify
 import threading
 
@@ -27,11 +27,11 @@ app = Flask(__name__)
 
 # Track bot health for the status endpoint
 bot_status = {
-    "last_heartbeat": None,
+    "last_heartbeat":     None,
     "last_bar_processed": None,
-    "last_error": None,
-    "loop_count": 0,
-    "status": "starting",
+    "last_error":         None,
+    "loop_count":         0,
+    "status":             "starting",
 }
 
 @app.route("/")
@@ -55,7 +55,6 @@ alpaca = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
 
 # ── Settings (mirrors your Pine Script inputs) ─────────────────────────
 SYMBOL       = "QQQ"
-TIMEFRAME    = "4h"
 SCORE_NEEDED = 4
 EMA_FAST     = 21
 EMA_SLOW     = 55
@@ -76,68 +75,78 @@ CB_LOSSES    = 3
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  DATA
+#  DATA  (Alpaca — no more Yahoo Finance)
 # ══════════════════════════════════════════════════════════════════════
 
-def _download_with_timeout(symbol, period, interval, timeout=30):
-    """Run yf.download in a thread with a hard timeout."""
-    result = [None]
-    error  = [None]
+def get_data(symbol=SYMBOL, days=200):
+    """Fetch 1H bars from Alpaca and resample to 4H."""
+    log.info(f"Fetching {symbol} 1H bars from Alpaca...")
+    try:
+        end   = datetime.now(pytz.utc)
+        start = end - timedelta(days=days)
 
-    def _dl():
-        try:
-            result[0] = yf.download(symbol, period=period, interval=interval,
-                                     auto_adjust=True, progress=False)
-        except Exception as e:
-            error[0] = e
+        bars = alpaca.get_bars(
+            symbol,
+            TimeFrame.Hour,
+            start=start.isoformat(),
+            end=end.isoformat(),
+            adjustment="all"
+        ).df
 
-    t = threading.Thread(target=_dl, daemon=True)
-    t.start()
-    t.join(timeout)
+        if bars is None or bars.empty:
+            log.error("No data returned from Alpaca!")
+            return None
 
-    if t.is_alive():
-        log.error(f"Yahoo Finance download timed out after {timeout}s — skipping")
+        # Flatten multi-index if present
+        if isinstance(bars.index, pd.MultiIndex):
+            bars = bars.xs(symbol, level="symbol")
+
+        bars.index   = pd.to_datetime(bars.index, utc=True)
+        bars.columns = [c.lower() for c in bars.columns]
+
+        # Resample 1H -> 4H
+        df_4h = bars.resample("4h").agg({
+            "open":   "first",
+            "high":   "max",
+            "low":    "min",
+            "close":  "last",
+            "volume": "sum"
+        }).dropna()
+
+        log.info(f"Got {len(df_4h)} 4H bars from Alpaca")
+        return df_4h
+
+    except Exception as e:
+        log.error(f"Alpaca get_data error: {e}\n{traceback.format_exc()}")
         return None
-    if error[0]:
-        log.error(f"Yahoo Finance download error: {error[0]}")
-        return None
-    return result[0]
-
-
-def get_data(symbol=SYMBOL, period="180d", interval="1h"):
-    """Fetch OHLCV data from Yahoo Finance."""
-    log.info(f"Fetching {symbol} data...")
-    df = _download_with_timeout(symbol, period, interval, timeout=30)
-
-    if df is None or df.empty:
-        log.error("No data returned from Yahoo Finance!")
-        return None
-
-    df.columns = [c.lower() if isinstance(c, str) else c[0].lower() for c in df.columns]
-    df.dropna(inplace=True)
-
-    # Resample 1h → 4h
-    df_4h = df.resample("4h").agg({
-        "open":   "first",
-        "high":   "max",
-        "low":    "min",
-        "close":  "last",
-        "volume": "sum"
-    }).dropna()
-
-    log.info(f"Got {len(df_4h)} 4H bars")
-    return df_4h
 
 
 def get_daily_ema50(symbol=SYMBOL):
-    """Fetch daily EMA50 for HTF filter."""
+    """Fetch daily bars from Alpaca and return EMA50."""
     try:
-        df = _download_with_timeout(symbol, period="120d", interval="1d", timeout=30)
-        if df is None or df.empty:
+        end   = datetime.now(pytz.utc)
+        start = end - timedelta(days=120)
+
+        bars = alpaca.get_bars(
+            symbol,
+            TimeFrame.Day,
+            start=start.isoformat(),
+            end=end.isoformat(),
+            adjustment="all"
+        ).df
+
+        if bars is None or bars.empty:
             return None
-        df.columns = [c.lower() if isinstance(c, str) else c[0].lower() for c in df.columns]
-        ema = talib.trend.ema_indicator(df["close"], window=50)
-        return float(ema.iloc[-1])
+
+        if isinstance(bars.index, pd.MultiIndex):
+            bars = bars.xs(symbol, level="symbol")
+
+        bars.columns = [c.lower() for c in bars.columns]
+        ema = talib.trend.ema_indicator(bars["close"], window=50)
+        val = float(ema.iloc[-1])
+        log.info(f"Daily EMA50 = {val:.2f}")
+        return val
+
     except Exception as e:
         log.error(f"Daily EMA50 error: {e}")
         return None
@@ -193,8 +202,8 @@ def add_indicators(df):
 
     df["rsi"] = talib.momentum.rsi(df["close"], window=RSI_LEN)
 
-    macd_line   = talib.trend.macd(df["close"])
-    signal_line = talib.trend.macd_signal(df["close"])
+    macd_line       = talib.trend.macd(df["close"])
+    signal_line     = talib.trend.macd_signal(df["close"])
     df["macd_hist"] = macd_line - signal_line
 
     df["vol_avg"] = df["volume"].rolling(20).mean()
@@ -306,29 +315,28 @@ def exit_position(reason="exit"):
 # ══════════════════════════════════════════════════════════════════════
 
 state = {
-    "in_trade":       False,
-    "entry_price":    0.0,
-    "sl":             0.0,
-    "tp1":            0.0,
-    "tp2":            0.0,
-    "partial_done":   False,
-    "consec_losses":  0,
-    "last_bar_time":  None,
+    "in_trade":      False,
+    "entry_price":   0.0,
+    "sl":            0.0,
+    "tp1":           0.0,
+    "tp2":           0.0,
+    "partial_done":  False,
+    "consec_losses": 0,
+    "last_bar_time": None,
 }
 
 
 def is_market_hours():
     """
-    Returns True during extended market window.
-    We use 9:00 AM – 8:00 PM ET so we never miss a 4H bar close
-    (e.g. a bar opening at 1:30 PM closes at 5:30 PM, after the 4 PM hard close).
+    9:00 AM - 8:00 PM ET on weekdays.
+    Extended past 4 PM so we catch 4H bars that close after market close.
     """
     et  = pytz.timezone("America/New_York")
     now = datetime.now(et)
-    if now.weekday() >= 5:   # Saturday/Sunday
+    if now.weekday() >= 5:
         return False
-    market_open  = now.replace(hour=9,  minute=0,  second=0, microsecond=0)
-    market_close = now.replace(hour=20, minute=0,  second=0, microsecond=0)
+    market_open  = now.replace(hour=9,  minute=0, second=0, microsecond=0)
+    market_close = now.replace(hour=20, minute=0, second=0, microsecond=0)
     return market_open <= now <= market_close
 
 
@@ -396,15 +404,15 @@ def run_bot():
 
             # New bar confirmed — process it
             log.info(f"✅ New confirmed 4H bar: {bar_ts}")
-            state["last_bar_time"] = bar_ts
+            state["last_bar_time"]           = bar_ts
             bot_status["last_bar_processed"] = str(bar_ts)
 
             prev   = df.loc[:bar_ts].iloc[:-1]
             now_et = datetime.now(pytz.timezone("America/New_York"))
             month  = now_et.month
 
-            d_ema50            = get_daily_ema50()
-            score, conds       = score_bar(row, prev, d_ema50)
+            d_ema50                       = get_daily_ema50()
+            score, conds                  = score_bar(row, prev, d_ema50)
             vol_ok, sept_ok, filter_notes = check_filters(row, month)
 
             log.info(
@@ -476,7 +484,7 @@ def run_bot():
                     f"Entry check — bull_regime={bull_regime}  "
                     f"score={score}>={SCORE_NEEDED}  "
                     f"vol_ok={vol_ok}  sept_ok={sept_ok}  "
-                    f"→ signal={'YES 🟢' if long_signal else 'NO'}"
+                    f"signal={'YES 🟢' if long_signal else 'NO'}"
                 )
 
                 if long_signal:
@@ -500,16 +508,15 @@ def run_bot():
                     state["partial_done"] = False
 
                     if cb < 1.0:
-                        log.info(f"⚠️  Circuit breaker active — {state['consec_losses']} losses, half size")
+                        log.info(f"⚠️  Circuit breaker — {state['consec_losses']} losses, half size")
 
         except Exception as e:
             err_msg = f"{e}\n{traceback.format_exc()}"
             log.error(f"Bot loop error: {err_msg}")
-            bot_status["last_error"]  = str(e)
-            bot_status["status"]      = "error — recovering"
-            time.sleep(60)   # short sleep then retry instead of dying
+            bot_status["last_error"] = str(e)
+            bot_status["status"]     = "error — recovering"
+            time.sleep(60)
 
-        # Check every 5 minutes
         time.sleep(300)
 
 
@@ -518,11 +525,10 @@ def run_bot():
 # ══════════════════════════════════════════════════════════════════════
 
 def watchdog():
-    """Monitors the bot thread and restarts it if it dies."""
     global bot_thread
     log.info("👁️  Watchdog started")
     while True:
-        time.sleep(120)   # check every 2 minutes
+        time.sleep(120)
         if not bot_thread.is_alive():
             log.error("⚠️  Bot thread died — restarting!")
             bot_status["status"] = "restarting"
@@ -536,14 +542,11 @@ def watchdog():
 # ══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Start bot thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
 
-    # Start watchdog thread
     wd_thread = threading.Thread(target=watchdog, daemon=True)
     wd_thread.start()
 
-    # Flask keeps Render alive
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
