@@ -8,6 +8,7 @@ import os
 import logging
 from datetime import datetime
 import pytz
+import traceback
 
 import pandas as pd
 import ta as talib
@@ -24,9 +25,26 @@ log = logging.getLogger(__name__)
 # ── Flask app (keeps Render alive) ─────────────────────────────────────
 app = Flask(__name__)
 
+# Track bot health for the status endpoint
+bot_status = {
+    "last_heartbeat": None,
+    "last_bar_processed": None,
+    "last_error": None,
+    "loop_count": 0,
+    "status": "starting",
+}
+
 @app.route("/")
 def home():
-    return jsonify({"status": "APEX Bot Running", "time": str(datetime.now())}), 200
+    return jsonify({
+        "status":               "APEX Bot Running",
+        "time":                 str(datetime.now()),
+        "bot_status":           bot_status["status"],
+        "last_heartbeat":       str(bot_status["last_heartbeat"]),
+        "last_bar_processed":   str(bot_status["last_bar_processed"]),
+        "last_error":           str(bot_status["last_error"]),
+        "loop_count":           bot_status["loop_count"],
+    }), 200
 
 # ── Alpaca connection ───────────────────────────────────────────────────
 API_KEY    = os.environ.get("ALPACA_KEY",    "YOUR_KEY_HERE")
@@ -37,8 +55,8 @@ alpaca = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
 
 # ── Settings (mirrors your Pine Script inputs) ─────────────────────────
 SYMBOL       = "QQQ"
-TIMEFRAME    = "4h"          # 4-hour bars
-SCORE_NEEDED = 4             # minimum score to enter long
+TIMEFRAME    = "4h"
+SCORE_NEEDED = 4
 EMA_FAST     = 21
 EMA_SLOW     = 55
 SMA_50       = 50
@@ -50,11 +68,11 @@ RSI_MAX      = 65.0
 ATR_LEN      = 14
 SL_ATR       = 2.0
 RR           = 2.5
-RISK_PCT     = 1.5           # % of equity to risk per trade
-PART_PCT     = 0.40          # partial exit at 1R (40%)
-VOL_MULT     = 2.0           # ATR spike threshold
-SKIP_SEPT    = True          # skip September entries
-CB_LOSSES    = 3             # consecutive losses before half size
+RISK_PCT     = 1.5
+PART_PCT     = 0.40
+VOL_MULT     = 2.0
+SKIP_SEPT    = True
+CB_LOSSES    = 3
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -64,13 +82,18 @@ CB_LOSSES    = 3             # consecutive losses before half size
 def get_data(symbol=SYMBOL, period="180d", interval="1h"):
     """Fetch OHLCV data from Yahoo Finance."""
     log.info(f"Fetching {symbol} data...")
-    df = yf.download(symbol, period=period, interval=interval,
-                     auto_adjust=True, progress=False)
-    if df.empty:
+    try:
+        df = yf.download(symbol, period=period, interval=interval,
+                         auto_adjust=True, progress=False)
+    except Exception as e:
+        log.error(f"Yahoo Finance download error: {e}")
+        return None
+
+    if df is None or df.empty:
         log.error("No data returned from Yahoo Finance!")
         return None
 
-    df.columns = [c.lower() for c in df.columns]
+    df.columns = [c.lower() if isinstance(c, str) else c[0].lower() for c in df.columns]
     df.dropna(inplace=True)
 
     # Resample 1h → 4h
@@ -82,29 +105,32 @@ def get_data(symbol=SYMBOL, period="180d", interval="1h"):
         "volume": "sum"
     }).dropna()
 
+    log.info(f"Got {len(df_4h)} 4H bars")
     return df_4h
 
 
 def get_daily_ema50(symbol=SYMBOL):
     """Fetch daily EMA50 for HTF filter."""
-    df = yf.download(symbol, period="120d", interval="1d",
-                     auto_adjust=True, progress=False)
-    if df.empty:
+    try:
+        df = yf.download(symbol, period="120d", interval="1d",
+                         auto_adjust=True, progress=False)
+        if df is None or df.empty:
+            return None
+        df.columns = [c.lower() if isinstance(c, str) else c[0].lower() for c in df.columns]
+        ema = talib.trend.ema_indicator(df["close"], window=50)
+        return float(ema.iloc[-1])
+    except Exception as e:
+        log.error(f"Daily EMA50 error: {e}")
         return None
-    df.columns = [c.lower() for c in df.columns]
-    ema = talib.trend.ema_indicator(df["close"], window=50)
-    return float(ema.iloc[-1])
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  INDICATORS  (mirrors your Pine Script exactly)
+#  INDICATORS
 # ══════════════════════════════════════════════════════════════════════
 
 def calc_supertrend(df, length=ST_LEN, multiplier=ST_MULT):
-    """Calculate SuperTrend — same logic as Pine Script, using pure pandas."""
     hl2 = (df["high"] + df["low"]) / 2
 
-    # ATR manually (no pandas_ta)
     high_low   = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
     low_close  = (df["low"]  - df["close"].shift()).abs()
@@ -138,60 +164,47 @@ def calc_supertrend(df, length=ST_LEN, multiplier=ST_MULT):
 
 
 def add_indicators(df):
-    """Add all indicators to the dataframe."""
-    # MAs
     df["ema21"]  = talib.trend.ema_indicator(df["close"], window=EMA_FAST)
     df["ema55"]  = talib.trend.ema_indicator(df["close"], window=EMA_SLOW)
     df["sma50"]  = talib.trend.sma_indicator(df["close"], window=SMA_50)
     df["sma200"] = talib.trend.sma_indicator(df["close"], window=SMA_200)
 
-    # ATR
     df["atr"]       = talib.volatility.average_true_range(df["high"], df["low"], df["close"], window=ATR_LEN)
     df["atr_20avg"] = df["atr"].rolling(20).mean()
 
-    # RSI
     df["rsi"] = talib.momentum.rsi(df["close"], window=RSI_LEN)
 
-    # MACD histogram
     macd_line   = talib.trend.macd(df["close"])
     signal_line = talib.trend.macd_signal(df["close"])
     df["macd_hist"] = macd_line - signal_line
 
-    # Volume
     df["vol_avg"] = df["volume"].rolling(20).mean()
+    df["adx"]     = talib.trend.adx_neg(df["high"], df["low"], df["close"], window=14)
 
-    # ADX
-    df["adx"] = talib.trend.adx_neg(df["high"], df["low"], df["close"], window=14)
-
-    # SuperTrend
     df = calc_supertrend(df)
-
     df.dropna(inplace=True)
     return df
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  SCORING ENGINE  (mirrors Pine Script C1–C7)
+#  SCORING ENGINE
 # ══════════════════════════════════════════════════════════════════════
 
 def score_bar(row, prev_rows, d_ema50):
-    """Return (score, conditions_dict) for the latest bar."""
-    close  = row["close"]
-    low    = row["low"]
+    close = row["close"]
 
-    # EMA21 pullback touch (last 4 bars)
     ema_touch = any(
         prev_rows["low"].iloc[-(i+1)] <= prev_rows["ema21"].iloc[-(i+1)] * 1.005
         for i in range(min(4, len(prev_rows)))
     )
 
-    c1 = bool(row["ema21"] > row["ema55"])                    # EMA stack
-    c2 = bool(row["st_bull"])                                  # SuperTrend bull
-    c3 = bool(d_ema50 is None or close > d_ema50)             # HTF EMA50
-    c4 = bool(row["rsi"] < RSI_MAX)                           # RSI not overbought
-    c5 = bool(row["macd_hist"] > prev_rows["macd_hist"].iloc[-1])  # MACD turning up
-    c6 = bool(row["volume"] > row["vol_avg"])                  # Volume ok
-    c7 = bool(ema_touch)                                       # EMA dip
+    c1 = bool(row["ema21"] > row["ema55"])
+    c2 = bool(row["st_bull"])
+    c3 = bool(d_ema50 is None or close > d_ema50)
+    c4 = bool(row["rsi"] < RSI_MAX)
+    c5 = bool(row["macd_hist"] > prev_rows["macd_hist"].iloc[-1])
+    c6 = bool(row["volume"] > row["vol_avg"])
+    c7 = bool(ema_touch)
 
     score = sum([c1, c2, c3, c4, c5, c6, c7])
 
@@ -209,7 +222,6 @@ def score_bar(row, prev_rows, d_ema50):
 
 
 def check_filters(row, month):
-    """Returns (vol_ok, sept_ok, filter_notes)."""
     vol_spike = bool(row["atr"] > row["atr_20avg"] * VOL_MULT)
     sept_skip = SKIP_SEPT and month == 9
 
@@ -250,7 +262,7 @@ def get_position():
 
 
 def enter_long(qty, sl, tp1, tp2, score):
-    log.info(f"LONG ENTRY — qty={qty}  SL={sl:.2f}  TP1={tp1:.2f}  TP={tp2:.2f}  score={score}/7")
+    log.info(f"🟢 LONG ENTRY — qty={qty}  SL={sl:.2f}  TP1={tp1:.2f}  TP2={tp2:.2f}  score={score}/7")
     alpaca.submit_order(
         symbol        = SYMBOL,
         qty           = qty,
@@ -264,35 +276,16 @@ def exit_position(reason="exit"):
     try:
         pos_qty = get_position()
         if pos_qty > 0:
-            log.info(f"CLOSING POSITION — reason: {reason}")
+            log.info(f"🔴 CLOSING POSITION — reason: {reason}")
             alpaca.close_position(SYMBOL)
     except Exception as e:
         log.error(f"Exit error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  CONSECUTIVE LOSS TRACKER
-# ══════════════════════════════════════════════════════════════════════
-
-def get_consec_losses():
-    try:
-        activities = alpaca.get_activities(activity_types="FILL")
-        orders = alpaca.list_orders(status="closed", limit=20, direction="desc")
-        # Simple approach: check last N closed orders for profit/loss
-        consec = 0
-        for order in orders:
-            # We track via closed trade PnL using positions history
-            break
-        return consec
-    except:
-        return 0
-
-
-# ══════════════════════════════════════════════════════════════════════
 #  MAIN LOOP
 # ══════════════════════════════════════════════════════════════════════
 
-# Simple in-memory state
 state = {
     "in_trade":       False,
     "entry_price":    0.0,
@@ -306,29 +299,26 @@ state = {
 
 
 def is_market_hours():
-    """Check if US market is open."""
-    et = pytz.timezone("America/New_York")
+    """
+    Returns True during extended market window.
+    We use 9:00 AM – 8:00 PM ET so we never miss a 4H bar close
+    (e.g. a bar opening at 1:30 PM closes at 5:30 PM, after the 4 PM hard close).
+    """
+    et  = pytz.timezone("America/New_York")
     now = datetime.now(et)
     if now.weekday() >= 5:   # Saturday/Sunday
         return False
-    market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    market_open  = now.replace(hour=9,  minute=0,  second=0, microsecond=0)
+    market_close = now.replace(hour=20, minute=0,  second=0, microsecond=0)
     return market_open <= now <= market_close
 
 
 def get_last_closed_4h_bar(df):
-    """
-    Return the last FULLY CLOSED 4H bar.
-    A 4H bar starting at 09:30 closes at 13:30.
-    We never act on the currently-forming bar — only confirmed closes.
-    """
+    """Return the last FULLY CLOSED 4H bar."""
     now_et = datetime.now(pytz.timezone("America/New_York"))
 
-    # Drop the last row if its bar has not fully closed yet
-    # Each 4H bar timestamp is its OPEN time; it closes 4 hours later
     closed_bars = []
-    for ts, bar_row in df.iterrows():
-        # ts is bar open time — bar closes 4h later
+    for ts, _ in df.iterrows():
         bar_close_time = ts + pd.Timedelta(hours=4)
         if bar_close_time.astimezone(pytz.timezone("America/New_York")) <= now_et:
             closed_bars.append(ts)
@@ -342,22 +332,35 @@ def get_last_closed_4h_bar(df):
 
 def run_bot():
     """Main bot loop — checks every 5 minutes, only acts on confirmed closed 4H bars."""
-    log.info("APEX Bot started — waiting for 4H bar closes...")
+    log.info("🚀 APEX Bot started — waiting for 4H bar closes...")
+    bot_status["status"] = "running"
 
     while True:
         try:
+            bot_status["last_heartbeat"] = datetime.now()
+            bot_status["loop_count"]    += 1
+
             if not is_market_hours():
                 log.info("Market closed — sleeping 15 min...")
+                bot_status["status"] = "sleeping (market closed)"
                 time.sleep(900)
                 continue
 
-            # ── Fetch data ─────────────────────────────────────────
+            bot_status["status"] = "active"
+
+            # ── Fetch data ──────────────────────────────────────────
             df = get_data()
             if df is None or len(df) < 50:
+                log.warning("Not enough data — retrying in 5 min...")
                 time.sleep(300)
                 continue
 
             df = add_indicators(df)
+
+            if len(df) < 10:
+                log.warning("Not enough bars after indicators — retrying...")
+                time.sleep(300)
+                continue
 
             # ── Only use confirmed closed 4H bars ──────────────────
             row, bar_ts = get_last_closed_4h_bar(df)
@@ -368,25 +371,25 @@ def run_bot():
 
             # Skip if we already processed this bar
             if state["last_bar_time"] == bar_ts:
-                log.info(f"Already processed bar at {bar_ts} — waiting for next 4H close...")
+                log.info(f"Already processed bar {bar_ts} — next check in 5 min...")
                 time.sleep(300)
                 continue
 
             # New bar confirmed — process it
-            log.info(f"New confirmed 4H bar closed at {bar_ts}")
+            log.info(f"✅ New confirmed 4H bar: {bar_ts}")
             state["last_bar_time"] = bar_ts
+            bot_status["last_bar_processed"] = str(bar_ts)
 
-            prev     = df.loc[:bar_ts].iloc[:-1]   # all bars before this one
-            now_et   = datetime.now(pytz.timezone("America/New_York"))
-            month    = now_et.month
+            prev   = df.loc[:bar_ts].iloc[:-1]
+            now_et = datetime.now(pytz.timezone("America/New_York"))
+            month  = now_et.month
 
-            d_ema50  = get_daily_ema50()
-            score, conds = score_bar(row, prev, d_ema50)
+            d_ema50            = get_daily_ema50()
+            score, conds       = score_bar(row, prev, d_ema50)
             vol_ok, sept_ok, filter_notes = check_filters(row, month)
 
-            # ── Log current state ──────────────────────────────────
             log.info(
-                f"Score={score}/7  "
+                f"📊 Score={score}/7  "
                 f"RSI={row['rsi']:.1f}  "
                 f"ADX={row['adx']:.1f}  "
                 f"ST={'Bull' if row['st_bull'] else 'Bear'}  "
@@ -394,7 +397,7 @@ def run_bot():
             )
             log.info(f"Conditions: {conds}")
 
-            # ── Check existing position ────────────────────────────
+            # ── Check existing position ─────────────────────────────
             pos_qty = get_position()
             state["in_trade"] = pos_qty > 0
 
@@ -405,55 +408,56 @@ def run_bot():
                 tp1   = state["tp1"]
                 tp2   = state["tp2"]
 
-                # SuperTrend flip exit
                 if not row["st_bull"]:
                     exit_position("ST Flip")
-                    state["in_trade"]     = False
+                    state["in_trade"]      = False
                     state["consec_losses"] += 1
 
-                # EMA flip exit
                 elif row["ema21"] < row["ema55"]:
                     exit_position("EMA Flip")
-                    state["in_trade"]     = False
+                    state["in_trade"]      = False
                     state["consec_losses"] += 1
 
-                # Death cross exit
                 elif row["sma50"] < row["sma200"]:
                     exit_position("Death Cross")
-                    state["in_trade"]     = False
+                    state["in_trade"]      = False
                     state["consec_losses"] += 1
 
-                # Stop loss hit
                 elif close <= sl:
                     exit_position("Stop Loss")
-                    state["in_trade"]     = False
+                    state["in_trade"]      = False
                     state["consec_losses"] += 1
 
-                # Full TP hit
                 elif close >= tp2:
                     exit_position("Take Profit")
                     state["in_trade"]      = False
                     state["consec_losses"] = 0
 
-                # Partial exit at 1R
                 elif close >= tp1 and not state["partial_done"]:
                     part_qty = max(1, round(pos_qty * PART_PCT))
-                    log.info(f"PARTIAL EXIT at 1R — selling {part_qty} shares")
+                    log.info(f"🟡 PARTIAL EXIT at 1R — selling {part_qty} shares")
                     alpaca.submit_order(
                         symbol=SYMBOL, qty=part_qty, side="sell",
                         type="market", time_in_force="day"
                     )
                     state["partial_done"] = True
-                    state["sl"]           = max(sl, ep)   # move stop to breakeven
+                    state["sl"]           = max(sl, ep)
 
             else:
-                # ── Look for new entry ─────────────────────────────
+                # ── Look for new entry ──────────────────────────────
                 bull_regime = row["close"] > row["sma50"]
                 long_signal = (
                     bull_regime and
                     score >= SCORE_NEEDED and
                     vol_ok and
                     sept_ok
+                )
+
+                log.info(
+                    f"Entry check — bull_regime={bull_regime}  "
+                    f"score={score}>={SCORE_NEEDED}  "
+                    f"vol_ok={vol_ok}  sept_ok={sept_ok}  "
+                    f"→ signal={'YES 🟢' if long_signal else 'NO'}"
                 )
 
                 if long_signal:
@@ -480,10 +484,32 @@ def run_bot():
                         log.info(f"⚠️  Circuit breaker active — {state['consec_losses']} losses, half size")
 
         except Exception as e:
-            log.error(f"Bot loop error: {e}")
+            err_msg = f"{e}\n{traceback.format_exc()}"
+            log.error(f"Bot loop error: {err_msg}")
+            bot_status["last_error"]  = str(e)
+            bot_status["status"]      = "error — recovering"
+            time.sleep(60)   # short sleep then retry instead of dying
 
         # Check every 5 minutes
         time.sleep(300)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  WATCHDOG — restarts bot thread if it ever dies
+# ══════════════════════════════════════════════════════════════════════
+
+def watchdog():
+    """Monitors the bot thread and restarts it if it dies."""
+    global bot_thread
+    log.info("👁️  Watchdog started")
+    while True:
+        time.sleep(120)   # check every 2 minutes
+        if not bot_thread.is_alive():
+            log.error("⚠️  Bot thread died — restarting!")
+            bot_status["status"] = "restarting"
+            bot_thread = threading.Thread(target=run_bot, daemon=True)
+            bot_thread.start()
+            log.info("✅ Bot thread restarted")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -491,9 +517,13 @@ def run_bot():
 # ══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Run bot in background thread
+    # Start bot thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
+
+    # Start watchdog thread
+    wd_thread = threading.Thread(target=watchdog, daemon=True)
+    wd_thread.start()
 
     # Flask keeps Render alive
     port = int(os.environ.get("PORT", 10000))
